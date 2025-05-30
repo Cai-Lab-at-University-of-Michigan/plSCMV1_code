@@ -1,0 +1,13 @@
+[package]
+name = "sndif_server"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+indicatif = "0.17.1"
+zip = "0.6.3"
+crossbeam-channel = "0.5"
+byteorder = "1.4.3"
+ctrlc = "3.2.3"
