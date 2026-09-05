@@ -1,3 +1,37 @@
+"""Serial protocols for the stage controllers and the Pico devices.
+
+This module has three classes. There is one class for each type of device on the
+USB bus of the control PC. Each object has a ``threading.Lock`` for its serial
+device. Thus the Flask thread and the gamepad thread in ``run.py`` cannot mix
+their bytes on the serial line.
+
+:class:`ESPStageControl`
+    A Newport ESP stage controller at 19200 baud. The commands are ASCII text
+    and end with a newline character. The commands are ``PA`` to move, ``VA``
+    for the velocity, ``MV`` to move until a stop, ``TP`` for the position,
+    ``TS`` for the status, ``OR`` for the home position, ``ST`` to stop, ``AB``
+    to stop immediately, and ``MO`` to energize the motor.
+
+:class:`TriggerControl`
+    A Raspberry Pi Pico at 115200 baud. It has one command:
+    ``T <channel> <stage> <notify> <frames> \r``. The reply is ``D``.
+
+:class:`DACControl`
+    A Raspberry Pi Pico at 115200 baud. There is one device for each laser. The
+    commands are ``S`` and a uint16 little-endian galvo table, ``A`` and a uint8
+    AOTF table, and ``R`` to go to the first value of the table. The reply for
+    each command is ``D``.
+
+Each table has 2554 values. The value 2554 is the sum of 150 lead-in lines, 2304
+sensor lines, and 100 trailing lines. The system uses one value for each line of
+the rolling shutter.
+
+The method ``is_done`` reads the serial line until it gets a line with data. If
+the device does not reply, the method continues to wait.
+
+See docs/control-api.md#serial-protocols.
+"""
+
 import serial
 import threading
 import time
@@ -59,7 +93,7 @@ class ESPStageControl:
 
     def wait_for_move(self) -> None:
         while self.is_moving():
-            pass  # maybe replace with less busy wait
+            pass  # A delay here would decrease the load on the CPU.
 
     def send_move(self, axis: int, position: float) -> None:
         cmd = f"WT50\n{axis}PA{position}\n"
