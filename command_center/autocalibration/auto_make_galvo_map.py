@@ -1,3 +1,16 @@
+"""Records the galvo position map with the camera PC.
+
+For each channel, this script moves the galvo DAC through the full uint16 range
+in steps of 256. It keeps the galvo at the same position for one full frame and
+opens the AOTF fully. It sends one trigger for each step.
+
+The frames go through the camera PC to the storage host. To read the archives,
+use ``parse_galvo_map.py``.
+
+This is step 1 of 3 in the procedure for the position map. See
+docs/calibration.md.
+"""
+
 import sys
 
 sys.path.append("../")
