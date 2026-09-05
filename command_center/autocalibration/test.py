@@ -1,3 +1,10 @@
+"""Test script that applies the wavetables and sends triggers many times.
+
+This script is a test version of ``auto_record_2nd.py``. It repeats the
+operation many times and does not record one set of data. It is not part of the
+calibration procedure.
+"""
+
 import sys
 
 sys.path.append("/home/loganaw/cameraman/command_center")
