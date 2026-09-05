@@ -1,3 +1,67 @@
+/*
+ * cameraman_windows: captures the camera data and sends the frames.
+ *
+ * This application operates on the camera PC. It controls three Hamamatsu
+ * cameras with DCAM-API. It compresses each frame and sends it to the storage
+ * host. It also shows a live preview with three panels.
+ *
+ * The name "stateless" tells you that this application keeps no experiment
+ * data. It operates continuously and sends each frame immediately. The storage
+ * host puts each frame in the correct archive. To do this, the storage host
+ * uses the last name that it received on its control port. See
+ * docs/frame-protocol.md.
+ *
+ * THREADS. The function camera_thread_main starts these threads for each of the
+ * three cameras:
+ *
+ *   camera_thread_main    The capture thread. It operates at
+ *                         REALTIME_PRIORITY_CLASS. It reads
+ *                         dcamcap_transferinfo until the next frame is
+ *                         available. Then it gets a buffer with malloc and
+ *                         copies the frame with dcambuf_copyframe. Then it adds
+ *                         a time value in milliseconds. Last, it puts the data
+ *                         in a queue with a mutex.
+ *   io_thread_loop        Five IO threads (IO_THREAD_CONCURRENCY). Each thread
+ *                         gets a buffer from the queue and copies it to the
+ *                         preview area. Then it compresses the buffer with zstd
+ *                         at level 1. Then it opens a new TCP connection and
+ *                         sends the header and the payload. Last, it closes the
+ *                         connection and releases the buffer. A new connection
+ *                         for each frame keeps the transmitter stateless. It
+ *                         also lets the receiver use the half-close operation
+ *                         to find the end of each frame.
+ *   preview_update_thread The preview thread. It decreases the size of the
+ *                         newest frame by PREVIEW_SCALE_FACTOR. Then it changes
+ *                         the data to 8-bit with the minimum value and the
+ *                         maximum value of that frame. Then it writes the
+ *                         result into the shared RGB preview area at the
+ *                         horizontal offset of this camera.
+ *
+ * WinMain controls the Win32 message loop. It draws the three preview panels of
+ * 576 pixels. Below the panels it shows the minimum value, the maximum value,
+ * and the frame rate.
+ *
+ * FORMAT ON THE LINE. The application sends a header of 32 bytes (struct
+ * sendme, see sendme.h). Then it sends the frame with zstd compression. The
+ * values in the header add up to 25 bytes. But the header is 32 bytes, because
+ * the application sends a C structure. Thus the alignment padding is part of
+ * the format. CAUTION: THE FORMAT CHANGES WITH THE ABI. If you change
+ * sendme.h, you must also change the parser in sndif_server/src/main.rs. Do the
+ * two changes in the same commit.
+ *
+ * TIMING. The cameras use a rolling shutter. The line interval (H_INTERVAL) is
+ * 4.868 microseconds. The camera has 150 lead-in lines (HSYNC). The control PC
+ * sends the galvo tables and the AOTF tables. The system uses one value for
+ * each line. Thus each table has 150 + FRAME_HEIGHT + 100 = 2554 values.
+ *
+ * TO STOP THIS APPLICATION, close the preview window. Then stop the process.
+ *
+ * The address and the port of the server are the constants SERVERIP and PORT
+ * below.
+ *
+ * See docs/architecture.md and docs/frame-protocol.md.
+ */
+
 #include <SDKDDKVer.h>
 #define WIN32_LEAN_AND_MEAN             // Exclude rarely-used stuff from Windows headers
 // Windows Header Files
@@ -418,7 +482,8 @@ void preview_update_thread(std::queue<void*>* buffer, std::mutex* mutex, int cam
 				const size_t offset_src = (i * FRAME_WIDTH / PREVIEW_SCALE_FACTOR) + j;
 				const size_t offset_dest = (i * 3 * FRAME_WIDTH / PREVIEW_SCALE_FACTOR) + (camera_id * FRAME_WIDTH / PREVIEW_SCALE_FACTOR) + j;
 
-				// Map all three channels to the buffer (i.e. b/w -> rgb)
+				// Put the value in the three channels. This changes the black and
+				// white data to RGB data.
 				preview_buffer_cast[offset_dest].blue = scaled_image[offset_src];
 				preview_buffer_cast[offset_dest].green = scaled_image[offset_src];
 				preview_buffer_cast[offset_dest].red = scaled_image[offset_src];
