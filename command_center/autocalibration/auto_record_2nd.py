@@ -1,3 +1,20 @@
+"""Records frames with the second-order correction for the next fit.
+
+This script makes a wavetable with the current position map and the current
+second-order correction. Then it records N frames for each channel. The galvo
+moves during the record operation. Thus the data shows the curve in operational
+conditions. The next fit removes that curve.
+
+To read the archives, use ``parse_2nd.py``.
+
+This is step 1 of 3 in the procedure for the second-order correction. See
+docs/calibration.md.
+
+The coefficients ``correction_test`` are also in ``second_order_results.py``,
+``test.py``, and ``tile_scan.ipynb``. If you calculate new coefficients, change
+all four locations.
+"""
+
 import sys
 
 sys.path.append("/home/loganaw/cameraman/command_center")
