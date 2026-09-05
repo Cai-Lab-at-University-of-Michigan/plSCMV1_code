@@ -1,3 +1,37 @@
+"""Device server for the control PC. Gives the HTTP API and the gamepad control.
+
+This is the only program that opens a serial port. All the other programs use
+the Flask API on port 5000. This includes the notebooks, the calibration
+scripts, and manual commands.
+
+The program controls these devices. It finds them by their permanent device
+path:
+
+* Two Newport ESP stage controllers. One controls the x axis and the y axis. The
+  other controls the z axis.
+* One Pico trigger controller.
+* Three Pico DAC and AOTF controllers. There is one for each laser at 488 nm,
+  560 nm, and 642 nm.
+
+At the start, the program resets the three DAC Pico devices. Then it reads the
+calibrated wavetables from the files ``488.txt``, ``560.txt``, and ``642.txt``.
+Then it sends the default AOTF table. Look for three lines with the text
+``Finished in ...s [True]``. A value of ``False`` tells you that the
+illumination of that channel is not correct.
+
+The Flask application operates on a background thread. The parameter
+``use_reloader=False`` prevents a second process. The main thread stays in the
+gamepad loop. The API operates when the program shows the text
+``Please connect your gamepad...``. Thus you can use the system without a
+gamepad. That message is not a failure message.
+
+The axis numbers are logical numbers: ``1 = z``, ``2 = x``, and ``3 = y``. The
+dictionary ``channel_map`` connects them to the two controllers. The channel
+numbers ``0``, ``1``, and ``2`` are the lasers at 488 nm, 560 nm, and 642 nm.
+
+For the full list of the endpoints, see docs/control-api.md.
+"""
+
 import stage_control
 import sys
 import Gamepad
