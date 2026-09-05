@@ -1,3 +1,13 @@
+"""Calculates the line data from the archives of the second-order scan.
+
+This script is the same as ``parse_galvo_map.py``. But it calculates the mean
+along ``axis=0`` and not ``axis=1``, because this scan changes in the other
+direction. It writes the result to ``save.p``.
+
+This is step 2 of 3 in the procedure for the second-order correction. See
+docs/calibration.md.
+"""
+
 import zipfile
 import glob
 import zstd
