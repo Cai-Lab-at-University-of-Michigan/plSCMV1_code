@@ -1,3 +1,38 @@
+"""Calibration library for the galvo wavetables and the signal alignment.
+
+All the scripts in ``autocalibration/`` use this module. The module has three
+groups of functions.
+
+**Wavetable synthesis.** The function :func:`calculate_calibrated_galvo` applies
+the position map, the second-order correction, and the phase offset. It gives
+the uint16 table of 2554 values for a DAC Pico. The value 2554 is the sum of
+150 lead-in lines, 2304 sensor lines, and 100 trailing lines. The system uses
+one value for each line of the rolling shutter.
+
+**Fit functions.** The class :class:`poly_from_fit` contains ``np.polyfit`` and
+adds the method :meth:`~poly_from_fit.invert`. That method calculates the
+inverse directly for a degree of 0, 1, or 2. This is why the fits from a DAC
+value to a line number have a degree of 2. The fit in the other direction has a
+degree of 3.
+
+**Signal alignment.** The function :func:`calculate_signal_offset` measures the
+difference in phase between the line data of two channels. It uses a moving
+window and more samples to measure an offset of less than one line. The function
+:func:`map_calibration` changes that result to line coordinates.
+
+The system has two different sets of channel numbers. The variable
+``channel_maps`` gives the calibration index for each API channel as
+``[(0, 0), (1, 2), (2, 1)]``. Give the calibration index to
+:func:`calculate_calibrated_galvo`. Give the API channel to
+``APIClient.apply_dac_wavetable``.
+
+The files ``fit_calibration.p`` and ``fit_hamamatsu.p`` contain
+:class:`poly_from_fit` objects in the pickle format. This module must be
+available with this name to read those files.
+
+For the full procedure, see docs/calibration.md.
+"""
+
 import pickle
 import numpy as np
 import tifffile
