@@ -1,3 +1,18 @@
+"""Coefficients of the second-order correction. There is one array for each laser.
+
+Each array is a polynomial fit of degree 12. The fit gives the curve that stays
+after the linear position map. The sequence of the values is the sequence of
+``np.polyval``. The highest power is first.
+
+The function ``continuous_calibration.calculate_calibrated_galvo`` uses these
+arrays as the parameter ``second_order_correction``. That function multiplies
+them by ``tan(13.6 deg)``. Then it subtracts the result.
+
+These values are the output of a measurement. To make new values, use the
+procedure in ``autocalibration/``. Do not change the values manually. See
+docs/calibration.md.
+"""
+
 import numpy as np
 
 second_488 = np.array(
