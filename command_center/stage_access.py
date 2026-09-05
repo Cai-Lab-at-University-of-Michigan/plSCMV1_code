@@ -1,3 +1,15 @@
+"""Functions that give access to the stage API.
+
+This module is an alternative to :mod:`api_client` for manual operation. It has
+module functions and a module variable ``SERVER_URL``. It does not have a client
+object.
+
+Use :class:`api_client.APIClient` for new code. That class also gives access to
+the trigger, the galvo, and the AOTF endpoints.
+
+To use a different control PC, change the value of ``SERVER_URL``.
+"""
+
 import urllib.request
 import json
 import time
