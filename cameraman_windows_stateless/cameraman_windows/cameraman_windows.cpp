@@ -11,35 +11,44 @@
  * uses the last name that it received on its control port. See
  * docs/frame-protocol.md.
  *
- * THREADS. The function camera_thread_main starts these threads for each of the
- * three cameras:
+ * SETTINGS. The application reads its settings at the start. It does not use
+ * constants in the code. See config.h for the four layers: the default values,
+ * the file cameraman.ini, the PLSCM_ environment variables, and the command
+ * line. WinMain calls load_config one time, before it starts any thread. Then
+ * no thread writes to the settings. Thus no thread needs a lock.
+ *
+ * DEMO MODE. With the setting demo_mode the application makes its own frames.
+ * It does not open a camera, and Windows does not load dcamapi.dll. Thus you
+ * can test the application on a PC that has no camera and no DCAM-API runtime.
+ * See frame_source.h and docs/cameraman-demo-mode.md.
+ *
+ * THREADS. The function camera_thread_main starts these threads for each
+ * camera:
  *
  *   camera_thread_main    The capture thread. It operates at
- *                         REALTIME_PRIORITY_CLASS. It reads
- *                         dcamcap_transferinfo until the next frame is
- *                         available. Then it gets a buffer with malloc and
- *                         copies the frame with dcambuf_copyframe. Then it adds
- *                         a time value in milliseconds. Last, it puts the data
- *                         in a queue with a mutex.
- *   io_thread_loop        Five IO threads (IO_THREAD_CONCURRENCY). Each thread
- *                         gets a buffer from the queue and copies it to the
- *                         preview area. Then it compresses the buffer with zstd
- *                         at level 1. Then it opens a new TCP connection and
- *                         sends the header and the payload. Last, it closes the
- *                         connection and releases the buffer. A new connection
- *                         for each frame keeps the transmitter stateless. It
- *                         also lets the receiver use the half-close operation
- *                         to find the end of each frame.
+ *                         REALTIME_PRIORITY_CLASS. It gets a buffer with
+ *                         malloc. Then it asks the FrameSource for the next
+ *                         frame. Then it adds a time value in milliseconds.
+ *                         Last, it puts the data in a queue with a mutex.
+ *   io_thread_loop        The IO threads (io_threads). Each thread gets a
+ *                         buffer from the queue and copies it to the preview
+ *                         area. Then it compresses the buffer with zstd. Then
+ *                         it opens a new TCP connection and sends the header
+ *                         and the payload. Last, it closes the connection and
+ *                         releases the buffer. A new connection for each frame
+ *                         keeps the transmitter stateless. It also lets the
+ *                         receiver use the half-close operation to find the end
+ *                         of each frame.
  *   preview_update_thread The preview thread. It decreases the size of the
- *                         newest frame by PREVIEW_SCALE_FACTOR. Then it changes
- *                         the data to 8-bit with the minimum value and the
- *                         maximum value of that frame. Then it writes the
- *                         result into the shared RGB preview area at the
- *                         horizontal offset of this camera.
+ *                         newest frame by preview_scale. Then it changes the
+ *                         data to 8-bit with the minimum value and the maximum
+ *                         value of that frame. Then it writes the result into
+ *                         the shared RGB preview area at the horizontal offset
+ *                         of this camera.
  *
- * WinMain controls the Win32 message loop. It draws the three preview panels of
- * 576 pixels. Below the panels it shows the minimum value, the maximum value,
- * and the frame rate.
+ * WinMain controls the Win32 message loop. It draws one preview panel for each
+ * camera. Below the panels it shows the minimum value, the maximum value, and
+ * the frame rate.
  *
  * FORMAT ON THE LINE. The application sends a header of 32 bytes (struct
  * sendme, see sendme.h). Then it sends the frame with zstd compression. The
@@ -49,15 +58,13 @@
  * sendme.h, you must also change the parser in sndif_server/src/main.rs. Do the
  * two changes in the same commit.
  *
- * TIMING. The cameras use a rolling shutter. The line interval (H_INTERVAL) is
- * 4.868 microseconds. The camera has 150 lead-in lines (HSYNC). The control PC
+ * TIMING. The cameras use a rolling shutter. The line interval (h_interval) is
+ * 4.868 microseconds. The camera has 150 lead-in lines (hsync). The control PC
  * sends the galvo tables and the AOTF tables. The system uses one value for
- * each line. Thus each table has 150 + FRAME_HEIGHT + 100 = 2554 values.
+ * each line. Thus each table has 150 + frame_height + 100 = 2554 values.
  *
  * TO STOP THIS APPLICATION, close the preview window. Then stop the process.
- *
- * The address and the port of the server are the constants SERVERIP and PORT
- * below.
+ * Ctrl-C in the console window also stops it.
  *
  * See docs/architecture.md and docs/frame-protocol.md.
  */
@@ -77,9 +84,16 @@
 #include "dcamprop.h"
 #include "common.h"
 #pragma comment(lib,"dcamapi.lib")
+
+// Windows loads dcamapi.dll at the first DCAM call and not at the start of the
+// application. In demo mode the application makes no DCAM call. Thus it also
+// operates on a PC that does not have the DCAM-API runtime.
+#pragma comment(linker, "/DELAYLOAD:dcamapi.dll")
 ///// ----------------------------
 
 #include "util.h"
+#include "config.h"
+#include "frame_source.h"
 #include <zstd.h> // Installed through VCpkg
 
 #include<chrono>
@@ -114,39 +128,14 @@
 
 #include "sendme.h"
 
-#define CAMERA_NUMS 3
-#define IO_THREAD_CONCURRENCY 5
-#define FRAME_BUFFER_COUNT 1000
+// The settings. WinMain writes this variable one time, before it starts any
+// thread. No other function writes it. Thus no lock is necessary.
+Config g_config;
 
-// Parameters used for cameraman server (hardcoded right now)
-#define PORT 8080
-#define SERVERIP "sndif.cai-lab.org"
-#define SEND_CHUNK 4096*4
-//////
-
-// Parameters for camera timing
-#define H_INTERVAL (0.000004868)
-// 0.000004868 / 2 = 0.0000024338
-#define TRIGGER_INTERVAL (0.002)
-#define EXPOSURE_TIME 0.000017632
-//#define EXPOSURE_TIME 0.0001
-#define HSYNC 150
-//////
-
-// Parameters for each frame
-#define FRAME_WIDTH 2304
-#define FRAME_HEIGHT 2304
-#define FRAME_BYTES_PER_PX 2
-#define FRAME_WAIT_INTERVAL 1000
-//////
-
-
-// Parameters for live preview
-#define PREVIEW_SCALE_FACTOR 4
-uint8_t* preview_buffer;
-size_t preview_buffer_size = 3 * FRAME_WIDTH * FRAME_HEIGHT * 3 / PREVIEW_SCALE_FACTOR / PREVIEW_SCALE_FACTOR;
-uint16_t camera_min_vals[CAMERA_NUMS], camera_max_vals[CAMERA_NUMS];
-///////
+// The shared RGB preview area. The preview threads write it. WM_PAINT reads
+// it. One row has g_config.preview_stride bytes.
+uint8_t* preview_buffer = NULL;
+uint16_t camera_min_vals[MAX_CAMERAS], camera_max_vals[MAX_CAMERAS];
 
 std::mutex cout_mutex;
 std::mutex live_preview_mutex;
@@ -187,15 +176,15 @@ void wait_for_trigger() {
 }
 */
 
-void assignSettings(HDCAM hdcam) {
+void assignSettings(HDCAM hdcam, const Config& cfg) {
 	std::cout << "Calling camera settings: " << hdcam << std::endl;
 	dcamprop_setvalue(hdcam, DCAM_IDPROP_SENSORMODE, DCAMPROP_SENSORMODE__PROGRESSIVE); // set progressive mode (=2)
 	dcamprop_setvalue(hdcam, DCAM_IDPROP_READOUTSPEED, 3); // set fast mode (=3)
 	dcamprop_setvalue(hdcam, DCAM_IDPROP_SENSORCOOLER, DCAMPROP_SENSORCOOLER__ON); // sensor cooler on
 	dcamprop_setvalue(hdcam, DCAM_IDPROP_BINNING, DCAMPROP_BINNING__1); // binning for test
 
-	dcamprop_setvalue(hdcam, DCAM_IDPROP_EXPOSURETIME, EXPOSURE_TIME); // force exposure time
-	dcamprop_setvalue(hdcam, DCAM_IDPROP_INTERNAL_LINEINTERVAL, H_INTERVAL);
+	dcamprop_setvalue(hdcam, DCAM_IDPROP_EXPOSURETIME, cfg.exposure_time); // force exposure time
+	dcamprop_setvalue(hdcam, DCAM_IDPROP_INTERNAL_LINEINTERVAL, cfg.h_interval);
 	dcamprop_setvalue(hdcam, DCAM_IDPROP_TRIGGERACTIVE, DCAMPROP_TRIGGERACTIVE__EDGE);
 	dcamprop_setvalue(hdcam, DCAM_IDPROP_TRIGGER_MODE, DCAMPROP_TRIGGER_MODE__NORMAL); // CHECK
 	//dcamprop_setvalue(hdcam, DCAM_IDPROP_INTERNALLINESPEED, 1.335347432);
@@ -210,28 +199,28 @@ void assignSettings(HDCAM hdcam) {
 		dcamprop_setvalue(hdcam, DCAM_IDPROP_SUBARRAYMODE, DCAMPROP_MODE__ON);
 	}
 
-	dcamprop_setvalue(hdcam, DCAM_IDPROP_OUTPUTTRIGGER_PREHSYNCCOUNT, HSYNC); // PRESYNC
+	dcamprop_setvalue(hdcam, DCAM_IDPROP_OUTPUTTRIGGER_PREHSYNCCOUNT, cfg.hsync); // PRESYNC
 	dcamprop_setvalue(hdcam, DCAM_IDPROP_OUTPUTTRIGGER_DELAY, 0); // Delay output trigger
 
 	// -- Trigger 0 --
 	dcamprop_setvalue(hdcam, 0x001c0110, DCAMPROP_OUTPUTTRIGGER_SOURCE__TRIGGER); // source
 	dcamprop_setvalue(hdcam, 0x001c0120, DCAMPROP_OUTPUTTRIGGER_POLARITY__POSITIVE); // polarity
 	dcamprop_setvalue(hdcam, 0x001c0130, DCAMPROP_OUTPUTTRIGGER_ACTIVE__EDGE);  // edge mode
-	dcamprop_setvalue(hdcam, 0x001c0150, TRIGGER_INTERVAL); // period
+	dcamprop_setvalue(hdcam, 0x001c0150, cfg.trigger_interval); // period
 	dcamprop_setvalue(hdcam, 0x001c0160, DCAMPROP_OUTPUTTRIGGER_KIND__PROGRAMABLE); //kind
 
 	// -- Trigger 1 -- 
 	dcamprop_setvalue(hdcam, 0x001c0210, DCAMPROP_OUTPUTTRIGGER_SOURCE__TRIGGER); // source
 	dcamprop_setvalue(hdcam, 0x001c0220, DCAMPROP_OUTPUTTRIGGER_POLARITY__POSITIVE); // polarity
 	dcamprop_setvalue(hdcam, 0x001c0230, DCAMPROP_OUTPUTTRIGGER_ACTIVE__EDGE);  // edge mode
-	dcamprop_setvalue(hdcam, 0x001c0250, TRIGGER_INTERVAL); // period
+	dcamprop_setvalue(hdcam, 0x001c0250, cfg.trigger_interval); // period
 	dcamprop_setvalue(hdcam, 0x001c0260, DCAMPROP_OUTPUTTRIGGER_KIND__PROGRAMABLE); //kind
 
 	// -- Trigger 2 --
 	dcamprop_setvalue(hdcam, 0x001c0310, DCAMPROP_OUTPUTTRIGGER_SOURCE__HSYNC); // source
 	dcamprop_setvalue(hdcam, 0x001c0320, DCAMPROP_OUTPUTTRIGGER_POLARITY__POSITIVE); // polarity
 	dcamprop_setvalue(hdcam, 0x001c0330, DCAMPROP_OUTPUTTRIGGER_ACTIVE__EDGE);  // edge mode
-	dcamprop_setvalue(hdcam, 0x001c0350, H_INTERVAL / 2);  // 0.0000024338); // period
+	dcamprop_setvalue(hdcam, 0x001c0350, cfg.h_interval / 2);  // 0.0000024338); // period
 	dcamprop_setvalue(hdcam, 0x001c0360, DCAMPROP_OUTPUTTRIGGER_KIND__PROGRAMABLE); //kind
 
 	// Trigger Settings
@@ -261,19 +250,51 @@ HDCAM get_camera_by_id(int32 iDevice) {
 	return devopen.hdcam;
 }
 
-int send_buffer_over_ip(void* buffer, sendme* tosend, const char* server_ip, int connect_port) {
+/*
+ * Sends the full buffer. The function `send` can send less data than the size
+ * of the buffer. Thus one call is not sufficient. Gives false on an error.
+ */
+static bool send_all(SOCKET socket, const char* data, size_t size) {
+	size_t sent = 0;
+	while (sent < size) {
+		size_t remainder = size - sent;
+		if (remainder > 0x40000000) remainder = 0x40000000; // The limit of send() is an int.
+		const int result = send(socket, data + sent, (int)remainder, 0);
+		if (result == SOCKET_ERROR) return false;
+		if (result <= 0) return false;
+		sent += (size_t)result;
+	}
+	return true;
+}
+
+int send_buffer_over_ip(void* buffer, sendme* tosend, const Config& cfg) {
 	WSADATA wsaData;
 	struct addrinfo* address = NULL;
 	struct addrinfo hints;
 
-	size_t cbuffer_size = tosend->payload_size * 2;
+	// Compress the frame. ZSTD_compressBound gives the largest size that the
+	// compressed data can have.
+	const size_t cbuffer_size = ZSTD_compressBound(tosend->payload_size);
 	void* cbuffer = malloc(cbuffer_size);
-	size_t csize = ZSTD_compress(cbuffer, cbuffer_size, buffer, tosend->payload_size, 1);
+	if (cbuffer == NULL) {
+		printf("The application cannot get %zu bytes for the compressed frame.\n",
+			cbuffer_size);
+		return -1;
+	}
+
+	const size_t csize = ZSTD_compress(cbuffer, cbuffer_size, buffer,
+		tosend->payload_size, cfg.zstd_level);
+	if (ZSTD_isError(csize)) {
+		printf("zstd failed: %s\n", ZSTD_getErrorName(csize));
+		free(cbuffer);
+		return -2;
+	}
 
 	int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
 	if (iResult != 0) {
 		printf("WSAStartup failed with error: %d\n", iResult);
-		return -1;
+		free(cbuffer);
+		return -3;
 	}
 
 	memset(&hints, 0, sizeof(hints));
@@ -282,56 +303,66 @@ int send_buffer_over_ip(void* buffer, sendme* tosend, const char* server_ip, int
 	hints.ai_protocol = IPPROTO_TCP;
 
 	// Resolve the server address and port
-	iResult = getaddrinfo(server_ip, std::to_string(connect_port).c_str(), &hints, &address);
+	iResult = getaddrinfo(cfg.server_host.c_str(),
+		std::to_string(cfg.server_port).c_str(), &hints, &address);
 	if (iResult != 0) {
 		printf("getaddrinfo failed with error: %d\n", iResult);
+		free(cbuffer);
 		WSACleanup();
-		return -2;
+		return -4;
 	}
 
 	// Create connection socket
 	SOCKET ConnectSocket = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
 	if (ConnectSocket == INVALID_SOCKET) {
 		printf("socket failed with error: %ld\n", WSAGetLastError());
+		freeaddrinfo(address);
+		free(cbuffer);
 		WSACleanup();
-		return -3;
+		return -5;
 	}
 
 	// Connect to server.
 	if (connect(ConnectSocket, address->ai_addr, (int)address->ai_addrlen) == SOCKET_ERROR) {
-		closesocket(ConnectSocket);
 		printf("Unable to connect to server!\n");
-		WSACleanup();
-		return -4;
-	}
-
-	// Send an initial buffer
-	iResult = send(ConnectSocket, (const char*)tosend, (int)sizeof(sendme), 0);
-	if (iResult == SOCKET_ERROR) {
-		printf("Header send failed with error: %d\n", WSAGetLastError());
 		closesocket(ConnectSocket);
-		WSACleanup();
-		return -5;
-	}
-	//printf("Bytes Sent: %ld\n", iResult);
-
-	iResult = send(ConnectSocket, (const char*)cbuffer, (int)csize, 0);
-	if (iResult == SOCKET_ERROR) {
-		printf("Buffer send failed with error: %d\n", WSAGetLastError());
-		printf("\tBuffer size: %zu / %zu\n", csize, cbuffer_size);
-		closesocket(ConnectSocket);
+		freeaddrinfo(address);
+		free(cbuffer);
 		WSACleanup();
 		return -6;
 	}
-	//printf("Bytes Sent: %ld\n", iResult);
 
-	// shutdown the connection since no more data will be sent
+	// Send the header of 32 bytes.
+	if (!send_all(ConnectSocket, (const char*)tosend, sizeof(sendme))) {
+		printf("Header send failed with error: %d\n", WSAGetLastError());
+		closesocket(ConnectSocket);
+		freeaddrinfo(address);
+		free(cbuffer);
+		WSACleanup();
+		return -7;
+	}
+
+	// Send the compressed frame.
+	if (!send_all(ConnectSocket, (const char*)cbuffer, csize)) {
+		printf("Buffer send failed with error: %d\n", WSAGetLastError());
+		printf("\tBuffer size: %zu / %zu\n", csize, cbuffer_size);
+		closesocket(ConnectSocket);
+		freeaddrinfo(address);
+		free(cbuffer);
+		WSACleanup();
+		return -8;
+	}
+
+	// shutdown the connection since no more data will be sent. This half-close
+	// operation gives the end of the frame to the receiver.
 	iResult = shutdown(ConnectSocket, SD_SEND);
 	if (iResult == SOCKET_ERROR) {
 		printf("shutdown failed with error: %d\n", WSAGetLastError());
 		closesocket(ConnectSocket);
+		freeaddrinfo(address);
+		free(cbuffer);
 		WSACleanup();
-		return -7;
+		return -9;
 	}
 
 	// cleanup
@@ -343,7 +374,9 @@ int send_buffer_over_ip(void* buffer, sendme* tosend, const char* server_ip, int
 	return 1;
 }
 
-void io_thread_loop(std::queue<io_tuple>* io_buffer, std::mutex* io_mutex, int* killsignal, std::mutex* preview_mutex, std::queue<void*>* preview_buffer) {
+void io_thread_loop(const Config* cfg_ptr, std::queue<io_tuple>* io_buffer, std::mutex* io_mutex, int* killsignal, std::mutex* preview_mutex, std::queue<void*>* preview_buffer) {
+	const Config& cfg = *cfg_ptr;
+
 	for (size_t count = 0; !(*killsignal); count++) { // || (*io_buffer).size() > 0) {
 		io_tuple popped = { 0, 0, 0, 0, 0, 0, NULL };
 
@@ -371,11 +404,8 @@ void io_thread_loop(std::queue<io_tuple>* io_buffer, std::mutex* io_mutex, int* 
 		}
 
 		// Copy to the preview buffer for GUI
-		//void* for_preview = malloc(FRAME_WIDTH * FRAME_HEIGHT * FRAME_BYTES_PER_PX);
-		//memcpy(for_preview, buffer, FRAME_WIDTH * FRAME_HEIGHT * FRAME_BYTES_PER_PX);
 		preview_mutex->lock();
-		//preview_buffer->push(for_preview);
-		memcpy(preview_buffer->front(), buffer, FRAME_WIDTH * FRAME_HEIGHT * FRAME_BYTES_PER_PX);
+		memcpy(preview_buffer->front(), buffer, cfg.frame_bytes);
 		preview_mutex->unlock();
 
 		// rescale buffer
@@ -384,7 +414,7 @@ void io_thread_loop(std::queue<io_tuple>* io_buffer, std::mutex* io_mutex, int* 
 			tosend.payload_size /= 2;
 			uint16_t* buffer_cast = (uint16_t*)buffer;
 			uint8_t* buffer_processed = (uint8_t*)malloc(tosend.payload_size);
-			register float tmp = 0;
+			float tmp = 0;
 			for (size_t i = 0; i < tosend.payload_size; i++) {
 				tmp = buffer_cast[i];
 				tmp = sqrt(tmp);
@@ -400,213 +430,194 @@ void io_thread_loop(std::queue<io_tuple>* io_buffer, std::mutex* io_mutex, int* 
 		printf("[%d][#%09d] Frame processing...\n", tosend.cameraid, tosend.frameid);
 		cout_mutex.unlock();
 
-		// Write to IP buffer
-		int send_stat = send_buffer_over_ip(buffer, &tosend, SERVERIP, PORT);
-		//printf("Buffer return: %d\n", send_stat);
+		// Write to IP buffer. The setting send_enable = 0 gives a test of the
+		// preview and the window with no server.
+		if (cfg.send_enable) {
+			int send_stat = send_buffer_over_ip(buffer, &tosend, cfg);
+			//printf("Buffer return: %d\n", send_stat);
+		}
 
 		free(buffer);
 	}
 	//	std::cout << "IO Thread" << " completed " << count << std::endl;
 }
 
-void preview_update_thread(std::queue<void*>* buffer, std::mutex* mutex, int camera_id, int* killsignal) {
-	const size_t scaled_image_size = FRAME_HEIGHT * FRAME_WIDTH / PREVIEW_SCALE_FACTOR / PREVIEW_SCALE_FACTOR;
+void preview_update_thread(const Config* cfg_ptr, std::queue<void*>* buffer, std::mutex* mutex, int camera_id, int* killsignal) {
+	const Config& cfg = *cfg_ptr;
+
+	const size_t scaled_image_size = (size_t)cfg.panel_width * cfg.panel_height;
 	uint8_t* scaled_image = (uint8_t*)malloc(scaled_image_size);
-	uint16_t* frame = (uint16_t*)malloc(FRAME_HEIGHT * FRAME_WIDTH * sizeof(uint16_t));
+	uint16_t* frame = (uint16_t*)malloc(cfg.frame_bytes);
+	if (scaled_image == NULL || frame == NULL) return;
 
 	while (!(*killsignal)) {
 		mutex->lock();
-		//while (buffer->size() > 1) {
-		//	free(buffer->front());
-		//	buffer->pop();
-		//}
-		//if (buffer->size() > 0) { // read all existing frames
-		//	frame = (uint16_t*)buffer->front();
-		//	buffer->pop();
-		//	//std::cout << "read a frame... " << frame << ' ' << frame[0] << std::endl;
-		//}
-		memcpy(frame, buffer->front(), FRAME_HEIGHT * FRAME_WIDTH * sizeof(uint16_t));
+		memcpy(frame, buffer->front(), cfg.frame_bytes);
 		mutex->unlock();
-
-		if (frame == 0) { // no frame available
-			std::this_thread::sleep_for(std::chrono::milliseconds(5));
-			continue;
-		}
 
 		// rescale
 		memset(scaled_image, 0, scaled_image_size);
-		double min = DBL_MAX, max = DBL_MIN;
-		for (size_t i = 0; i < FRAME_HEIGHT * FRAME_WIDTH; i++) {
-			min = min(min, frame[i]);
-			max = max(max, frame[i]);
+		uint16_t min_val = 65535, max_val = 0;
+		const size_t pixel_count = (size_t)cfg.frame_width * cfg.frame_height;
+		for (size_t i = 0; i < pixel_count; i++) {
+			if (frame[i] < min_val) min_val = frame[i];
+			if (frame[i] > max_val) max_val = frame[i];
 		}
 
-		for (size_t i = 0; i < FRAME_HEIGHT / PREVIEW_SCALE_FACTOR; i++) {
-			for (size_t j = 0; j < FRAME_WIDTH / PREVIEW_SCALE_FACTOR; j++) {
-				register double sum = 0;
-				for (size_t ii = 0; ii < PREVIEW_SCALE_FACTOR; ii++) {
-					for (size_t jj = 0; jj < PREVIEW_SCALE_FACTOR; jj++) {
-						size_t offset_src = ((i * PREVIEW_SCALE_FACTOR) + ii) * FRAME_WIDTH;
-						offset_src += ((j * PREVIEW_SCALE_FACTOR) + jj);
+		// The frame can have one value only. This happens before the first
+		// frame arrives. Then the division below is a division by zero.
+		const double range = (max_val > min_val) ? (double)(max_val - min_val) : 0.0;
+
+		for (uint32_t i = 0; i < cfg.panel_height; i++) {
+			for (uint32_t j = 0; j < cfg.panel_width; j++) {
+				double sum = 0;
+				for (uint32_t ii = 0; ii < cfg.preview_scale; ii++) {
+					for (uint32_t jj = 0; jj < cfg.preview_scale; jj++) {
+						size_t offset_src = (size_t)((i * cfg.preview_scale) + ii) * cfg.frame_width;
+						offset_src += ((j * cfg.preview_scale) + jj);
 						sum += frame[offset_src];
 					}
 				}
 
-				sum /= PREVIEW_SCALE_FACTOR; // scale x
-				sum /= PREVIEW_SCALE_FACTOR; // scale y
+				sum /= cfg.preview_scale; // scale x
+				sum /= cfg.preview_scale; // scale y
 
 				// rescale to 8 bit range...
-				// sum = sqrt(sum);
-				sum -= min; // subtract lowest val
-				sum /= (max - min); // divide by largest val
-				// sum should now be [0,1]
-				sum *= 255; // Maximum value of a uint8_t
+				if (range > 0) {
+					sum -= min_val;      // subtract lowest val
+					sum /= range;        // divide by the range
+					// sum should now be [0,1]
+					sum *= 255;          // Maximum value of a uint8_t
+				}
+				else {
+					sum = 0;
+				}
 
 				if (sum < 0) sum = 0;
 				if (sum > 255) sum = 255;
 
 				const uint8_t new_val = (uint8_t)sum;
 
-				scaled_image[(i * (FRAME_WIDTH / PREVIEW_SCALE_FACTOR)) + j] = new_val;
+				scaled_image[((size_t)i * cfg.panel_width) + j] = new_val;
 			}
 		}
 
 		// Implement frame offset and flip?
 
-		RGB_Tuple* preview_buffer_cast = (RGB_Tuple*)preview_buffer;
 		live_preview_mutex.lock();
-		camera_min_vals[camera_id] = min;
-		camera_max_vals[camera_id] = max;
-		for (size_t i = 0; i < FRAME_HEIGHT / PREVIEW_SCALE_FACTOR; i++) {
-			for (size_t j = 0; j < FRAME_WIDTH / PREVIEW_SCALE_FACTOR; j++) {
-				const size_t offset_src = (i * FRAME_WIDTH / PREVIEW_SCALE_FACTOR) + j;
-				const size_t offset_dest = (i * 3 * FRAME_WIDTH / PREVIEW_SCALE_FACTOR) + (camera_id * FRAME_WIDTH / PREVIEW_SCALE_FACTOR) + j;
+		camera_min_vals[camera_id] = min_val;
+		camera_max_vals[camera_id] = max_val;
+		for (uint32_t i = 0; i < cfg.panel_height; i++) {
+			// One row of the preview area has preview_stride bytes. A Windows
+			// bitmap of 24 bits needs a row of a multiple of 4 bytes.
+			RGB_Tuple* row = (RGB_Tuple*)(preview_buffer + (i * cfg.preview_stride));
+			for (uint32_t j = 0; j < cfg.panel_width; j++) {
+				const uint8_t value = scaled_image[((size_t)i * cfg.panel_width) + j];
 
 				// Put the value in the three channels. This changes the black and
 				// white data to RGB data.
-				preview_buffer_cast[offset_dest].blue = scaled_image[offset_src];
-				preview_buffer_cast[offset_dest].green = scaled_image[offset_src];
-				preview_buffer_cast[offset_dest].red = scaled_image[offset_src];
+				RGB_Tuple* pixel = row + ((size_t)camera_id * cfg.panel_width) + j;
+				pixel->blue = value;
+				pixel->green = value;
+				pixel->red = value;
 			}
 		}
 		live_preview_mutex.unlock();
 
 		std::this_thread::sleep_for(std::chrono::milliseconds(5));
 	}
+
+	free(scaled_image);
+	free(frame);
 }
 
-void camera_thread_main(BOOL* trigger, BOOL* ready, HDCAM hdcam, HDCAMWAIT hwait, uint8_t id, uint32_t burst_id, uint32_t expt_id) {
+void camera_thread_main(const Config* cfg_ptr, FrameSource* source, BOOL* ready, uint8_t id, uint32_t burst_id, uint32_t expt_id) {
+	const Config& cfg = *cfg_ptr;
+
 	setThreadPriority(31);
 	SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
 
 	std::cout << std::setprecision(5);
 
-	// wait start param
-	DCAMERR err;
-	DCAMWAIT_START waitstart{
-		.size = sizeof(DCAMWAIT_START),
-		.eventhappened = 0,
-		.eventmask = DCAMWAIT_CAPEVENT_FRAMEREADY,
-		.timeout = FRAME_WAIT_INTERVAL
-	};
-	DCAMBUF_FRAME bufframe{
-		.size = sizeof(DCAMBUF_FRAME),
-		.iKind = 0,
-		.option = 0,
-		.iFrame = -1,
-		.buf = NULL,
-		.rowbytes = FRAME_WIDTH * FRAME_BYTES_PER_PX,
-		.type = DCAM_PIXELTYPE_NONE,
-		.width = FRAME_WIDTH,
-		.height = FRAME_HEIGHT,
-		.left = 0,
-		.top = 0,
-		.timestamp = 0,
-		.framestamp = 0,
-		.camerastamp = 0
-	};
-
 	int kill_signal = FALSE;
 
-	std::queue<void*> preview_buffer = {};
+	// The preview slot holds the newest frame only. The IO threads write it and
+	// the preview thread reads it.
+	std::queue<void*> preview_slot = {};
 	std::mutex preview_mutex;
-	void* preview_buffer_frame = malloc(FRAME_HEIGHT * FRAME_WIDTH * sizeof(uint16_t));
-	memset(preview_buffer_frame, 0, FRAME_HEIGHT * FRAME_WIDTH * sizeof(uint16_t));
-	preview_buffer.push(preview_buffer_frame); // Load one frame into buffer to be liveview
-	std::thread preview_thread = std::thread(preview_update_thread, &preview_buffer, &preview_mutex, id, &kill_signal);
+	void* preview_frame = malloc(cfg.frame_bytes);
+	memset(preview_frame, 0, cfg.frame_bytes);
+	preview_slot.push(preview_frame);
+	std::thread preview_thread = std::thread(preview_update_thread, cfg_ptr, &preview_slot, &preview_mutex, id, &kill_signal);
 
 	std::queue<io_tuple> io_buffer = {};
 	std::vector<std::thread> io_threads;
 	std::mutex io_mutex;
 
-	for (int i = 0; i < IO_THREAD_CONCURRENCY; i++) {
+	for (uint32_t i = 0; i < cfg.io_threads; i++) {
 		io_threads.push_back(
-			std::thread(io_thread_loop, &io_buffer, &io_mutex, &kill_signal, &preview_mutex, &preview_buffer)
+			std::thread(io_thread_loop, cfg_ptr, &io_buffer, &io_mutex, &kill_signal, &preview_mutex, &preview_slot)
 		);
 	}
 
-	err = dcamcap_start(hdcam, DCAMCAP_START_SEQUENCE);
-	if (failed(err))
-	{ /// TODO add better error handling here
-		dcamcon_show_dcamerr(hdcam, err, "dcamcap_start()");
-	}
+	if (source->start()) {
+		*ready = true;
 
-	*ready = true;
-
-	//auto overall_start = std::chrono::high_resolution_clock::now();
-	DCAMCAP_TRANSFERINFO captransferinfo;
-	for (uint32_t i = 1; true; i++) { // count frames processed
-		memset(&captransferinfo, 0, sizeof(captransferinfo));
-		captransferinfo.size = sizeof(captransferinfo);
-		captransferinfo.iKind = DCAMCAP_TRANSFERKIND_FRAME;
-
-		//	do { // Delay until a new frame is ready
-		//		err = dcamwait_start(hwait, &waitstart);
-		//	} while (failed(err)); // Loop until ready
-
-		do {
-			err = dcamcap_transferinfo(hdcam, &captransferinfo);
-			if (failed(err))
-			{
-				dcamcon_show_dcamerr(hdcam, err, "dcamcap_transferinfo()");
-				//return;
+		uint32_t dropped = 0;
+		for (uint32_t i = 1; true; i++) { // count frames processed
+			void* buffer = malloc(cfg.frame_bytes);
+			if (buffer == NULL) {
+				cout_mutex.lock();
+				printf("[%d] The application cannot get the memory for a frame.\n", (int)id);
+				cout_mutex.unlock();
+				std::this_thread::sleep_for(std::chrono::milliseconds(10));
+				continue;
 			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
-		} while (captransferinfo.nFrameCount < i);
 
+			if (!source->next_frame(i, buffer)) {
+				free(buffer);
+				break;
+			}
+
+			sendme_timecodet timecode = get_current_timecode(); // Should get from camera 
+
+			io_mutex.lock();
+			// The queue has no limit of its own. Each frame in it is one full
+			// frame of memory. If the network is slower than the camera, the
+			// queue grows until the PC has no memory. Thus the queue has a
+			// limit. The value 0 gives no limit.
+			if (cfg.max_queue_depth > 0 && io_buffer.size() >= cfg.max_queue_depth) {
+				io_mutex.unlock();
+				free(buffer);
+				dropped++;
+				if (dropped == 1 || dropped % 100 == 0) {
+					cout_mutex.lock();
+					printf("[%d] THE QUEUE IS FULL. The application released %u frames.\n",
+						(int)id, dropped);
+					cout_mutex.unlock();
+				}
+				continue;
+			}
+			io_buffer.push({ i, id, burst_id, expt_id, timecode, (sendme_int)cfg.frame_bytes, buffer });
+			io_mutex.unlock();
+		}
+	}
+	else {
 		cout_mutex.lock();
-		printf("[%d][#%09d] Got %d frames, last %d\n", id, i, captransferinfo.nFrameCount, captransferinfo.nNewestFrameIndex);
-		printf("[%d] GAP = %d\n", id, ((int)captransferinfo.nFrameCount) - ((int)i));
+		printf("[%d] The frame source did not start.\n", (int)id);
 		cout_mutex.unlock();
-
-		bufframe.buf = malloc(FRAME_WIDTH * FRAME_HEIGHT * FRAME_BYTES_PER_PX);
-		bufframe.iFrame = (i - 1) % FRAME_BUFFER_COUNT;
-
-		// Invalid parameter copyframe
-		do {
-			err = dcambuf_copyframe(hdcam, &bufframe);
-			if (failed(err) && err != DCAMERR_BUSY) dcamcon_show_dcamerr(hdcam, err, "dcambuf_copyframe()");
-		} while (err == DCAMERR_BUSY);
-		sendme_timecodet timecode = get_current_timecode(); // Should get from camera 
-
-		io_mutex.lock();
-		io_buffer.push({ i, id, burst_id, expt_id, timecode, FRAME_WIDTH * FRAME_HEIGHT * FRAME_BYTES_PER_PX, bufframe.buf });
-		io_mutex.unlock();
 	}
 
-	//double overall_elapsed_time = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - overall_start).count();
-
-	/*
-	dcamcap_stop(hdcam);
-	kill_signal = TRUE; // Tell io threads to die (should happen in ~1ms +/- current write activity)
-	for (int i = 0; i < io_threads.size(); i++) {
-		io_threads[i].join(); // TODO maybe this isn't needed (could allow async flushing in bg)
-	}
+	// The loop above stops only if the source has no more frames. Stop the
+	// other threads of this camera before this function releases their memory.
+	source->stop();
+	kill_signal = TRUE;
+	for (size_t i = 0; i < io_threads.size(); i++) io_threads[i].join();
 	preview_thread.join();
-	*/
+	free(preview_frame);
 }
 
-int init_api_and_cameras(HDCAM* hdcams, DCAMWAIT_OPEN* waitopens, HDCAMWAIT* hwaits) {
+int init_api_and_cameras(const Config& cfg, HDCAM* hdcams, DCAMWAIT_OPEN* waitopens, HDCAMWAIT* hwaits) {
 	DCAMERR err;
 
 	// Initialize DCAM-API ver 4.0
@@ -620,13 +631,15 @@ int init_api_and_cameras(HDCAM* hdcams, DCAMWAIT_OPEN* waitopens, HDCAMWAIT* hwa
 		return -1;
 	}
 
-	if (apiinit.iDeviceCount < CAMERA_NUMS) {
-		std::cout << "Wrong number of cameras detected!!" << std::endl;
+	if ((uint32_t)apiinit.iDeviceCount < cfg.camera_count) {
+		std::cout << "Wrong number of cameras detected!! The settings need "
+			<< cfg.camera_count << ". The PC has " << apiinit.iDeviceCount
+			<< "." << std::endl;
 		return -1;
 	}
 
-	for (uint8_t i = 0; i < CAMERA_NUMS; i++) {
-		hdcams[i] = get_camera_by_id(i);
+	for (uint32_t i = 0; i < cfg.camera_count; i++) {
+		hdcams[i] = get_camera_by_id((int32)i);
 
 		// Fail if not loaded
 		if (hdcams[i] == NULL) {
@@ -641,7 +654,7 @@ int init_api_and_cameras(HDCAM* hdcams, DCAMWAIT_OPEN* waitopens, HDCAMWAIT* hwa
 
 		// Hack camera settings :(
 		for (uint8_t j = 0; j < 5; j++) {
-			assignSettings(hdcams[i]);
+			assignSettings(hdcams[i], cfg);
 		}
 
 		memset(&waitopens[i], 0, sizeof(waitopens[i]));
@@ -656,7 +669,7 @@ int init_api_and_cameras(HDCAM* hdcams, DCAMWAIT_OPEN* waitopens, HDCAMWAIT* hwa
 
 		hwaits[i] = waitopens[i].hwait;
 
-		err = dcambuf_alloc(hdcams[i], FRAME_BUFFER_COUNT);
+		err = dcambuf_alloc(hdcams[i], (int32)cfg.dcam_buffers);
 		if (failed(err))
 		{
 			dcamcon_show_dcamerr(hdcams[i], err, "dcambuf_alloc()");
@@ -667,8 +680,8 @@ int init_api_and_cameras(HDCAM* hdcams, DCAMWAIT_OPEN* waitopens, HDCAMWAIT* hwa
 	return apiinit.iDeviceCount;
 }
 
-void kill_api_and_cameras(HDCAM* hdcams, HDCAMWAIT* hwaits) {
-	for (uint8_t i = 0; i < CAMERA_NUMS; i++) {
+void kill_api_and_cameras(const Config& cfg, HDCAM* hdcams, HDCAMWAIT* hwaits) {
+	for (uint32_t i = 0; i < cfg.camera_count; i++) {
 		//dcamcap_stop(hdcams[i]);
 		dcambuf_release(hdcams[i]);
 		dcamwait_close(hwaits[i]);
@@ -683,20 +696,23 @@ void kill_api_and_cameras(HDCAM* hdcams, HDCAMWAIT* hwaits) {
 std::deque<float> frame_rate_buffer = {};
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+	const Config& cfg = g_config;
+	const int panel_w = (int)cfg.panel_width;
+	const int panel_h = (int)cfg.panel_height;
+	const int image_w = panel_w * (int)cfg.camera_count;
+
 	switch (msg)
 	{
 	case WM_PAINT:
 	{
 		auto start = std::chrono::high_resolution_clock::now();
 
-		HBRUSH hBrush;
-		RECT rect;
 		PAINTSTRUCT ps;
 		HDC hdc = BeginPaint(hwnd, &ps);
 
 		// Create a memory DC and bitmap
 		HDC memDC = CreateCompatibleDC(hdc);
-		HBITMAP hBitmap = CreateCompatibleBitmap(hdc, FRAME_WIDTH, FRAME_HEIGHT);
+		HBITMAP hBitmap = CreateCompatibleBitmap(hdc, image_w, panel_h);
 
 		// Select the bitmap into the memory DC
 		HGDIOBJ hOldBitmap = SelectObject(memDC, hBitmap);
@@ -704,8 +720,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		// Set the bitmap bits from the memory buffer
 		BITMAPINFO bmi = { 0 };
 		bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-		bmi.bmiHeader.biWidth = 3 * FRAME_WIDTH / PREVIEW_SCALE_FACTOR;
-		bmi.bmiHeader.biHeight = -FRAME_HEIGHT / PREVIEW_SCALE_FACTOR;
+		bmi.bmiHeader.biWidth = image_w;
+		bmi.bmiHeader.biHeight = -panel_h;
 		bmi.bmiHeader.biPlanes = 1;
 		bmi.bmiHeader.biBitCount = 24;
 		bmi.bmiHeader.biCompression = BI_RGB;
@@ -713,19 +729,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		SetTextColor(hdc, RGB(0, 0, 0));
 		SetBkColor(hdc, RGB(255, 255, 255));
 		live_preview_mutex.lock();
-		SetDIBits(hdc, hBitmap, 0, FRAME_HEIGHT / PREVIEW_SCALE_FACTOR, preview_buffer, &bmi, DIB_RGB_COLORS);
-		for (size_t i = 0; i < CAMERA_NUMS; i++) {
+		SetDIBits(hdc, hBitmap, 0, panel_h, preview_buffer, &bmi, DIB_RGB_COLORS);
+		for (uint32_t i = 0; i < cfg.camera_count; i++) {
 			std::wstringstream stringbuilder;
 			stringbuilder << camera_min_vals[i] << " -> " << camera_max_vals[i] << "      ";
 			std::wstring out = stringbuilder.str();
-			TextOut(hdc, ((2304 / 4) * i) + 20, (2304 / 4) + 10, out.c_str(), out.size());
+			TextOut(hdc, (panel_w * (int)i) + 20, panel_h + 10, out.c_str(), (int)out.size());
 		}
 		live_preview_mutex.unlock();
-
-		//        rect = { 0, 0, 100, 100 };
-		//        hBrush = CreateSolidBrush(RGB(255, 0, 0));
-		//        FillRect(hdc, &rect, hBrush);
-		//        DeleteObject(hBrush);
 
 		SetTextColor(hdc, RGB(255, 0, 0));
 		SetBkColor(hdc, RGB(255, 255, 255));
@@ -735,6 +746,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 		{
 			std::wstringstream stringbuilder;
+			if (cfg.demo_mode)
+				stringbuilder << "DEMO MODE - NOT REAL DATA    ";
 			stringbuilder << "GUI Draw Time:  " << std::fixed << std::setprecision(2);
 			if (frame_rate_buffer.size() == 0) {
 				stringbuilder << "???";
@@ -746,13 +759,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			std::wstring frame_rate_string = stringbuilder.str();
 
 			SetTextAlign(hdc, TA_LEFT);
-			TextOut(hdc, 20, (2304 / 4) + 10 + 25, frame_rate_string.c_str(), frame_rate_string.size());
+			TextOut(hdc, 20, panel_h + 10 + 25, frame_rate_string.c_str(), (int)frame_rate_string.size());
 		}
 
 
 		// Blit the memory DC to the window DC
-		BitBlt(hdc, 0, 0, 3 * FRAME_WIDTH / PREVIEW_SCALE_FACTOR, FRAME_HEIGHT / PREVIEW_SCALE_FACTOR, memDC, 0, 0, SRCCOPY);
-		//StretchBlt(hdc, 0, 0, 2304 / 4, 2304 / 4, memDC, 0, 0, 2304/2, 2304/2, SRCCOPY);
+		BitBlt(hdc, 0, 0, image_w, panel_h, memDC, 0, 0, SRCCOPY);
 
 		// Clean up
 		SelectObject(memDC, hOldBitmap);
@@ -768,7 +780,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		while (frame_rate_buffer.size() > 50)
 			frame_rate_buffer.pop_back();
 
-		//std::this_thread::sleep_for(std::chrono::milliseconds(5));
 		InvalidateRect(hwnd, NULL, FALSE);
 
 		break;
@@ -796,6 +807,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	return 0;
 }
 
+/// Makes the text of the title of the window. The title shows the demo mode and
+/// the address of the storage host. Thus a person cannot confuse a demo run
+/// with a real run.
+static std::wstring make_window_title(const Config& cfg) {
+	std::wstringstream out;
+	if (cfg.demo_mode) out << L"DEMO MODE - NOT REAL DATA - ";
+	out << L"Camera Live Preview  [";
+	if (cfg.send_enable) {
+		out << convert_narrow_to_wide_string(cfg.server_host)
+			<< L":" << cfg.server_port;
+	}
+	else {
+		out << L"the application sends no data";
+	}
+	out << L"]";
+	return out.str();
+}
+
 // Entry point
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
@@ -807,34 +836,72 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 	freopen_s(&pConsoleStream, "CONOUT$", "w", stdout);
 	printf("Logging started...\n");
 
-	// Open HDCAM pointers
-	HDCAM hdcams[CAMERA_NUMS];
-	DCAMWAIT_OPEN waitopens[CAMERA_NUMS];
-	HDCAMWAIT hwaits[CAMERA_NUMS];
+	// Read the settings. This must happen before any thread starts. See
+	// config.h. If a value is not correct, load_config stops the application.
+	g_config = load_config();
+	const Config& cfg = g_config;
+	show_config(cfg);
 
-	int32 nDevice = init_api_and_cameras(hdcams, waitopens, hwaits); // apiinit.iDeviceCount;
-
-	// Launch capture threads
-	BOOL trigger = false, ready[CAMERA_NUMS];
-	uint32_t expt_id = 0, burst_id = 0;
-	std::thread threads[CAMERA_NUMS];
-	for (size_t i = 0; i < CAMERA_NUMS; i++) {
-		// TODO add capture number to this
-		ready[i] = false;
-		threads[i] = std::thread(camera_thread_main, &trigger, &ready[i], hdcams[i], hwaits[i], i, burst_id, expt_id);
+	if (cfg.demo_mode) {
+		printf("****************************************************\n");
+		printf("*                                                  *\n");
+		printf("*   DEMO MODE. THIS IS NOT MICROSCOPE DATA.        *\n");
+		printf("*   The application makes its own frames.          *\n");
+		printf("*   Each frame has expid = %-8u in its header. *\n", cfg.demo_expid);
+		printf("*                                                  *\n");
+		printf("****************************************************\n\n");
+		fflush(stdout);
 	}
 
-	//printf("Waiting for camera ready signals...\n");
-	//for (size_t i = 0; i < CAMERA_NUMS; i++)
-	//	while (!ready[i])
-	//		std::this_thread::sleep_for(std::chrono::milliseconds(100));
-	//printf("Cameras ready.\n");
+	// Open HDCAM pointers
+	HDCAM hdcams[MAX_CAMERAS];
+	DCAMWAIT_OPEN waitopens[MAX_CAMERAS];
+	HDCAMWAIT hwaits[MAX_CAMERAS];
+	memset(hdcams, 0, sizeof(hdcams));
+	memset(hwaits, 0, sizeof(hwaits));
 
-	// Allocate and clear buffers
-	preview_buffer = (uint8_t*)malloc(preview_buffer_size);
-	memset(preview_buffer, 0, preview_buffer_size);
-	memset(camera_min_vals, 0, CAMERA_NUMS * sizeof(uint16_t));
-	memset(camera_max_vals, 0, CAMERA_NUMS * sizeof(uint16_t));
+	if (!cfg.demo_mode) {
+		// This is the first DCAM call. Windows loads dcamapi.dll here.
+		if (init_api_and_cameras(cfg, hdcams, waitopens, hwaits) < 0) {
+			printf("The application cannot open the cameras. It stops.\n");
+			fflush(stdout);
+			MessageBoxA(NULL,
+				"The application cannot open the cameras.\n\n"
+				"The console window gives the message of DCAM-API.\n\n"
+				"To test the application without cameras, set demo_mode = 1.",
+				"cameraman_windows", MB_ICONERROR | MB_OK);
+			return 1;
+		}
+	}
+
+	// Allocate and clear buffers. This must happen BEFORE the threads start,
+	// because a preview thread writes into this memory.
+	preview_buffer = (uint8_t*)malloc(cfg.preview_bytes);
+	if (preview_buffer == NULL) {
+		MessageBoxA(NULL, "The application cannot get the memory for the preview.",
+			"cameraman_windows", MB_ICONERROR | MB_OK);
+		return 1;
+	}
+	memset(preview_buffer, 0, cfg.preview_bytes);
+	memset(camera_min_vals, 0, sizeof(camera_min_vals));
+	memset(camera_max_vals, 0, sizeof(camera_max_vals));
+
+	// Launch capture threads
+	BOOL ready[MAX_CAMERAS];
+	FrameSource* sources[MAX_CAMERAS];
+	uint32_t burst_id = 0;
+	// In demo mode each frame has a mark in the header. The value burstid and
+	// the value expid are 0 in a real run. The storage host writes expid in its
+	// log. Thus you can find the demo frames.
+	uint32_t expt_id = cfg.demo_mode ? cfg.demo_expid : 0;
+	std::thread threads[MAX_CAMERAS];
+	for (uint32_t i = 0; i < cfg.camera_count; i++) {
+		ready[i] = false;
+		sources[i] = cfg.demo_mode
+			? make_demo_source(cfg, (uint8_t)i)
+			: make_dcam_source(cfg, (uint8_t)i, hdcams[i]);
+		threads[i] = std::thread(camera_thread_main, &g_config, sources[i], &ready[i], (uint8_t)i, burst_id, expt_id);
+	}
 
 	// Register the window class
 	WNDCLASSEX wc = {
@@ -858,16 +925,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 		return 0;
 	}
 
+	// The client area holds one panel for each camera and two lines of text
+	// below them. AdjustWindowRect adds the size of the border and the title.
+	RECT window_rect = {
+		0, 0,
+		(LONG)(cfg.panel_width * cfg.camera_count),
+		(LONG)(cfg.panel_height + 80)
+	};
+	AdjustWindowRect(&window_rect, WS_OVERLAPPEDWINDOW, FALSE);
+
+	const std::wstring title = make_window_title(cfg);
+
 	// Create the window
 	HWND hwnd = CreateWindowEx(
 		0,
 		TEXT("myWindowClass"),
-		TEXT("Camera Live Preview"),
+		title.c_str(),
 		WS_OVERLAPPEDWINDOW,
 		CW_USEDEFAULT,
 		CW_USEDEFAULT,
-		(2304 / 4) * 3,
-		(600) + 200,
+		window_rect.right - window_rect.left,
+		window_rect.bottom - window_rect.top,
 		NULL,
 		NULL,
 		hInstance,
@@ -889,9 +967,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 		DispatchMessage(&msg);
 	}
 
+	printf("\nThe preview window closed. The capture threads continue.\n");
+	printf("To stop the application, use Ctrl-C in this window.\n");
+	fflush(stdout);
+
 	while (1) std::this_thread::sleep_for(std::chrono::seconds(1));
 
-	kill_api_and_cameras(hdcams, hwaits);
+	kill_api_and_cameras(cfg, hdcams, hwaits);
 
 	return 0;
 }

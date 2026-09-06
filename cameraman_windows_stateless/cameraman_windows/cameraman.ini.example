@@ -1,0 +1,114 @@
+# cameraman.ini - the settings of the capture application.
+#
+# HOW TO USE THIS FILE
+#   Copy this file to the directory of cameraman_windows.exe. Then give it the
+#   name cameraman.ini. Then remove the # character from the lines that you
+#   need. The application reads the file at the start.
+#
+# THE FOUR LAYERS
+#   A later layer replaces an earlier layer:
+#     1. The default values below.
+#     2. This file.
+#     3. The environment variables. The name is PLSCM_ and the name of the
+#        setting in capital letters. Example: PLSCM_SERVER_HOST.
+#     4. The command line. Example: cameraman_windows.exe --demo_mode=1
+#
+#   Use --config=<path> or PLSCM_CONFIG to read a different file.
+#
+# The application writes every value and its origin in the console at the
+# start. Keep that log. It tells you the configuration of that run.
+#
+# See docs/cameraman-demo-mode.md.
+
+# ---------------------------------------------------------------- Network
+
+# The address and the TCP port of the storage host.
+#
+# THE DEFAULT ADDRESS IS AN EXAMPLE. IT IS NOT A REAL HOST. You must give the
+# address of your storage host here. If you do not, the application writes a
+# warning at the start and no frame arrives.
+# server_host = sndif.example.com
+# server_port = 8080
+
+# Set this value to 0 to test the preview with no server. The application makes
+# the frames and compresses them, but it does not open a connection.
+# send_enable = 1
+
+# The zstd compression level, from 1 to 22. Level 1 is the fastest. The limit of
+# the system is the speed of the compressor and not the network. Do not increase
+# this value on the microscope.
+# zstd_level = 1
+
+# ---------------------------------------------------- Frames and threads
+
+# The number of cameras. The largest value is MAX_CAMERAS in config.h.
+# camera_count = 3
+
+# The size of one frame. These two values must be a multiple of preview_scale.
+# CAUTION: they must also agree with the wavetables on the control PC. Each
+# wavetable has hsync + frame_height + 100 values. See docs/calibration.md.
+# frame_width = 2304
+# frame_height = 2304
+
+# The number of IO threads for each camera. Each thread compresses one frame and
+# sends it. One thread is not sufficient for a full frame rate.
+# io_threads = 5
+
+# The number of frame buffers in the camera driver. CAUTION: this value uses
+# much memory. 1000 buffers of 10 MB for 3 cameras need about 32 GB of RAM.
+# dcam_buffers = 1000
+
+# The largest number of frames in the queue of one camera. If the network is
+# slower than the camera, the queue grows until the PC has no memory. Above this
+# limit the application releases the new frames and writes a message. The value
+# 0 gives no limit.
+# max_queue_depth = 64
+
+# ------------------------------------------------------- Camera timing
+
+# The line interval of the rolling shutter and the exposure time, in seconds.
+# These two values agree with the galvo wavetables. Do not change one of them
+# without a new calibration.
+# h_interval = 0.000004868
+# exposure_time = 0.000017632
+
+# The period of the output triggers in seconds.
+# trigger_interval = 0.002
+
+# The number of lead-in lines before the first sensor line.
+# hsync = 150
+
+# ------------------------------------------------------------- Preview
+
+# The preview is this number of times smaller than the frame.
+# preview_scale = 4
+
+# ----------------------------------------------------------- Demo mode
+
+# Set this value to 1 to test the application with no camera. The application
+# makes its own frames. It does not load dcamapi.dll.
+#
+# CAUTION: DO NOT PUT demo_mode = 1 IN THE FILE OF THE MICROSCOPE PC. The
+# archives then contain synthetic data.
+# demo_mode = 0
+
+# The time between two demo frames in milliseconds. The value 0 makes the frames
+# as fast as the PC can. Use max_queue_depth with a small value here.
+# demo_interval_ms = 100
+
+# The contents of the demo frames:
+#   bars    Noise and one bright band. Each camera has a different position.
+#   noise   Noise only. This gives the highest load on the compressor.
+#   file    A real frame from a file. This gives the most exact compression
+#           ratio. Use one member of a zip archive of the storage host.
+# demo_pattern = bars
+# demo_file =
+
+# The number of bits of noise, from 1 to 16. This value controls the compression
+# ratio. 16 gives a ratio near 1. 4 gives a high ratio.
+# demo_noise_bits = 16
+
+# The value of expid in the header of each demo frame. The storage host writes
+# this value in its log. Thus you can find the demo frames. A real run always
+# has the value 0. A value that starts with 0x is a hexadecimal value.
+# demo_expid = 0xDE305
