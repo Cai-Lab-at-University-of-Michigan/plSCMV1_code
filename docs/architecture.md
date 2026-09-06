@@ -15,7 +15,7 @@ flowchart LR
         cam["cameraman_windows<br/>DCAM capture and preview"]
     end
 
-    subgraph storage["Storage host (sndif.cai-lab.org)"]
+    subgraph storage["Storage host (sndif.example.com)"]
         srv["sndif_server<br/>:8080 frames, :8090 control"]
         zips[("&lt;name&gt;_ch0..2.zip")]
     end

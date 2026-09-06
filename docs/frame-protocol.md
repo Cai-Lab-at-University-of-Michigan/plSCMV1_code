@@ -101,7 +101,7 @@ closes its zip file. Then it opens the file `<name>_ch<N>.zip` in the work
 directory of the server.
 
 ```bash
-curl "http://sndif.cai-lab.org:8090/coord_+1.234,-5.678"
+curl "http://sndif.example.com:8090/coord_+1.234,-5.678"
 # The writers change to coord_+1.234,-5.678_ch0.zip, _ch1.zip, and _ch2.zip
 ```
 
